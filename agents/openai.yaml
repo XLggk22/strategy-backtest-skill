@@ -1,0 +1,4 @@
+interface:
+  display_name: "Strategy Backtest"
+  short_description: "Backtest monthly investment strategies"
+  default_prompt: "Use this skill to maintain a strategy catalog, backtest selected strategies from a chosen start date, and explain triggers, drawdowns, and market context."
