@@ -1,0 +1,76 @@
+[
+  {
+    "id": "IDX001",
+    "name": "标普500指数",
+    "aliases": ["S&P 500", "SP500", "标普500", "标普500指数", "SPY"],
+    "market_profile": "us",
+    "default_local_csv": "data/sp500_monthly.csv",
+    "download": {
+      "provider": "yahoo_chart",
+      "symbol": "SPY",
+      "interval": "1mo",
+      "range": "25y",
+      "pe_provider": {
+        "provider": "multpl_pe",
+        "url": "https://www.multpl.com/s-p-500-pe-ratio/table/by-month"
+      }
+    },
+    "notes": "默认使用 SPY ETF 作为价格和全收益代理，PE 使用 Multpl 月度数据。"
+  },
+  {
+    "id": "IDX002",
+    "name": "纳斯达克100指数",
+    "aliases": ["Nasdaq 100", "NASDAQ100", "纳指100", "纳斯达克100", "QQQ"],
+    "market_profile": "us",
+    "default_local_csv": "data/nasdaq100_monthly.csv",
+    "download": {
+      "provider": "yahoo_chart",
+      "symbol": "QQQ",
+      "interval": "1mo",
+      "range": "25y"
+    },
+    "notes": "默认使用 QQQ ETF 作为价格和全收益代理。"
+  },
+  {
+    "id": "IDX003",
+    "name": "沪深300指数",
+    "aliases": ["沪深300", "CSI 300", "CSI300", "HS300", "000300", "510300", "沪深300指数"],
+    "market_profile": "cn",
+    "default_local_csv": "data/csi300_monthly.csv",
+    "download": {
+      "provider": "yahoo_chart",
+      "symbol": "510300.SS",
+      "interval": "1mo",
+      "range": "25y"
+    },
+    "notes": "默认使用 510300 ETF 作为价格和全收益代理。"
+  },
+  {
+    "id": "IDX004",
+    "name": "中证500指数",
+    "aliases": ["中证500", "CSI 500", "CSI500", "510500", "中证500指数"],
+    "market_profile": "cn",
+    "default_local_csv": "data/csi500_monthly.csv",
+    "download": {
+      "provider": "yahoo_chart",
+      "symbol": "510500.SS",
+      "interval": "1mo",
+      "range": "25y"
+    },
+    "notes": "默认使用 510500 ETF 作为价格和全收益代理。"
+  },
+  {
+    "id": "IDX005",
+    "name": "上证50指数",
+    "aliases": ["上证50", "SSE 50", "SSE50", "510050", "上证50指数"],
+    "market_profile": "cn",
+    "default_local_csv": "data/sse50_monthly.csv",
+    "download": {
+      "provider": "yahoo_chart",
+      "symbol": "510050.SS",
+      "interval": "1mo",
+      "range": "25y"
+    },
+    "notes": "默认使用 510050 ETF 作为价格和全收益代理。"
+  }
+]

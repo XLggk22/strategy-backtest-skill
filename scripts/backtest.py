@@ -2,16 +2,33 @@ from __future__ import annotations
 
 import argparse
 import csv
+import html
 import json
 import math
+import re
+import subprocess
+import sys
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 
-CATALOG_PATH = Path(__file__).resolve().parents[1] / "references" / "strategy_catalog.json"
+ROOT = Path(__file__).resolve().parents[1]
+STRATEGY_CATALOG_PATH = ROOT / "references" / "strategy_catalog.json"
+INDEX_CATALOG_PATH = ROOT / "references" / "index_catalog.json"
+DATA_DIR = ROOT / "data"
+DEFAULT_REPORT_PATH = ROOT / "docs" / "backtest_report_latest.md"
+DEFAULT_CHART_PATH = ROOT / "docs" / "backtest_summary_chart.svg"
 BASELINE_AMOUNT = 1000.0
+ROW_RE = re.compile(
+    r"<tr class=\"(?:odd|even)\">\s*<td>([^<]+)</td>\s*<td>(.*?)</td>\s*</tr>",
+    re.S,
+)
+TAG_RE = re.compile(r"<[^>]+>")
+NUM_RE = re.compile(r"[-+]?\d[\d,]*\.?\d*")
 
 
 @dataclass
@@ -43,13 +60,22 @@ class StrategyResult:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Backtest strategy catalog against monthly index data.")
-    parser.add_argument("--data-csv", help="Monthly CSV matching references/data-schema.md")
+    parser.add_argument("--data-csv", help="Optional monthly CSV path. If omitted, the script auto-resolves local index data.")
     parser.add_argument("--start-date", help="Backtest start date in YYYY-MM-DD")
     parser.add_argument("--return-mode", choices=["price", "total_return"], default="price")
+    parser.add_argument("--index-name", default="Custom Index", help="Index name shown in the report, for example S&P 500 or CSI 300")
+    parser.add_argument(
+        "--market-profile",
+        choices=["auto", "us", "cn", "generic"],
+        default="auto",
+        help="Market-context profile used for trigger-period commentary",
+    )
     parser.add_argument("--strategy-ids", help="Comma-separated strategy IDs to compare")
     parser.add_argument("--custom-strategy-file", help="Optional JSON file with extra strategies")
-    parser.add_argument("--catalog", default=str(CATALOG_PATH), help="Override built-in strategy catalog path")
+    parser.add_argument("--catalog", default=str(STRATEGY_CATALOG_PATH), help="Override built-in strategy catalog path")
+    parser.add_argument("--index-catalog", default=str(INDEX_CATALOG_PATH), help="Override built-in index catalog path")
     parser.add_argument("--list-strategies", action="store_true", help="Print the strategy catalog table")
+    parser.add_argument("--list-indices", action="store_true", help="Print the built-in index catalog table")
     parser.add_argument("--top-periods", type=int, default=3, help="How many trigger periods to show per strategy")
     parser.add_argument("--output", help="Optional output Markdown file")
     return parser.parse_args()
@@ -76,12 +102,16 @@ def parse_optional_float(value: str | None) -> float | None:
     return float(value)
 
 
+def normalize_month(value: date) -> date:
+    return date(value.year, value.month, 1)
+
+
 def load_rows(csv_path: Path) -> list[Row]:
     rows: list[Row] = []
     with csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
         for raw in reader:
-            when = datetime.strptime(raw["date"], "%Y-%m-%d").date()
+            when = normalize_month(datetime.strptime(raw["date"], "%Y-%m-%d").date())
             rows.append(
                 Row(
                     when=when,
@@ -178,6 +208,30 @@ def format_threshold(value: float) -> str:
     return f">{int(round(value * 100))}%"
 
 
+def infer_market_profile(index_name: str, requested_profile: str) -> str:
+    if requested_profile != "auto":
+        return requested_profile
+
+    normalized = index_name.lower()
+    us_keywords = ["s&p", "sp500", "spy", "nasdaq", "ndx", "dow", "russell", "qqq"]
+    cn_keywords = ["沪深300", "沪深", "中证", "上证", "深证", "创业板", "csi 300", "csi300", "hs300"]
+
+    if any(keyword in normalized for keyword in us_keywords):
+        return "us"
+    if any(keyword in normalized for keyword in cn_keywords):
+        return "cn"
+    return "generic"
+
+
+def market_profile_label(profile: str) -> str:
+    labels = {
+        "us": "美股市场",
+        "cn": "中国市场",
+        "generic": "通用市场",
+    }
+    return labels.get(profile, profile)
+
+
 def evaluate_strategy(strategy: dict[str, Any], ctx: dict[str, Any]) -> tuple[float, list[str]]:
     kind = strategy["kind"]
 
@@ -189,7 +243,7 @@ def evaluate_strategy(strategy: dict[str, Any], ctx: dict[str, Any]) -> tuple[fl
         if pe_value is None:
             raise ValueError(f"Strategy '{ctx['name']}' requires PE data.")
         if pe_value > float(strategy["high_threshold"]):
-            return float(strategy["high_amount"]), [f"pe:{format_threshold(strategy['high_threshold'])}"]
+            return float(strategy["high_amount"]), [f"pe:{format_threshold(float(strategy['high_threshold']))}"]
         if pe_value < float(strategy["low_threshold"]):
             return float(strategy["low_amount"]), [f"pe:<{int(round(float(strategy['low_threshold'])))}%"]
         low = int(round(float(strategy["low_threshold"])))
@@ -217,7 +271,7 @@ def evaluate_strategy(strategy: dict[str, Any], ctx: dict[str, Any]) -> tuple[fl
     if kind == "ma12_deviation":
         deviation = ctx["ma12_deviation"]
         if deviation <= float(strategy["lower_threshold"]):
-            pct = abs(strategy["lower_threshold"]) * 100
+            pct = abs(float(strategy["lower_threshold"])) * 100
             return float(strategy["lower_amount"]), [f"ma12:<=-{int(round(pct))}%"]
         if deviation >= float(strategy["upper_threshold"]):
             pct = float(strategy["upper_threshold"]) * 100
@@ -236,13 +290,31 @@ def evaluate_strategy(strategy: dict[str, Any], ctx: dict[str, Any]) -> tuple[fl
     raise ValueError(f"Unsupported strategy kind: {kind}")
 
 
-def major_market_context(start: date, end: date) -> str:
-    windows = [
+def market_context_windows(profile: str) -> list[tuple[date, date, str]]:
+    if profile == "us":
+        return [
+            (date(2008, 1, 1), date(2010, 6, 1), "全球金融危机与后续修复"),
+            (date(2011, 7, 1), date(2012, 1, 1), "欧债危机与美债降级波动"),
+            (date(2020, 2, 1), date(2020, 6, 1), "疫情冲击与快速反弹"),
+            (date(2022, 1, 1), date(2022, 12, 1), "通胀与加息驱动的熊市"),
+        ]
+    if profile == "cn":
+        return [
+            (date(2008, 1, 1), date(2009, 12, 1), "全球金融危机对A股的冲击与修复"),
+            (date(2015, 6, 1), date(2016, 2, 1), "A股杠杆牛与股灾去杠杆"),
+            (date(2018, 1, 1), date(2019, 1, 1), "去杠杆与中美贸易摩擦调整"),
+            (date(2020, 2, 1), date(2020, 6, 1), "疫情冲击与国内流动性修复"),
+            (date(2022, 1, 1), date(2022, 12, 1), "地产压力与疫情扰动下的回撤"),
+        ]
+    return [
         (date(2008, 1, 1), date(2010, 6, 1), "全球金融危机与后续修复"),
-        (date(2011, 7, 1), date(2012, 1, 1), "欧债危机与美债降级波动"),
         (date(2020, 2, 1), date(2020, 6, 1), "疫情冲击与快速反弹"),
-        (date(2022, 1, 1), date(2022, 12, 1), "通胀与加息驱动的熊市"),
+        (date(2022, 1, 1), date(2022, 12, 1), "全球紧缩与风险资产调整"),
     ]
+
+
+def major_market_context(start: date, end: date, profile: str) -> str:
+    windows = market_context_windows(profile)
     best_overlap = 0
     best_label = ""
     for window_start, window_end, label in windows:
@@ -291,10 +363,7 @@ def objective_comment(result: StrategyResult, peers: list[StrategyResult]) -> st
     return "；".join(parts) + "。 " + summary
 
 
-def require_fields(strategies: list[dict[str, Any]], rows: list[Row], return_mode: str) -> None:
-    if return_mode == "total_return" and any(row.total_return_index is None for row in rows):
-        raise ValueError("return-mode=total_return requires total_return_index for every row.")
-
+def selected_strategies_need_pe(strategies: list[dict[str, Any]]) -> bool:
     def needs_pe(strategy: dict[str, Any]) -> bool:
         kind = strategy["kind"]
         if kind == "pe_percentile":
@@ -303,7 +372,219 @@ def require_fields(strategies: list[dict[str, Any]], rows: list[Row], return_mod
             return any(needs_pe(component) for component in strategy.get("components", []))
         return False
 
-    if any(needs_pe(strategy) for strategy in strategies) and any(row.pe is None for row in rows):
+    return any(needs_pe(strategy) for strategy in strategies)
+
+
+def selected_strategies_need_ma12(strategies: list[dict[str, Any]]) -> bool:
+    def needs_ma12(strategy: dict[str, Any]) -> bool:
+        kind = strategy["kind"]
+        if kind == "ma12_deviation":
+            return True
+        if kind == "composite_sum":
+            return any(needs_ma12(component) for component in strategy.get("components", []))
+        return False
+
+    return any(needs_ma12(strategy) for strategy in strategies)
+
+
+def previous_month_start(today: date) -> date:
+    first = date(today.year, today.month, 1)
+    if first.month == 1:
+        return date(first.year - 1, 12, 1)
+    return date(first.year, first.month - 1, 1)
+
+
+def assess_data_file(
+    csv_path: Path,
+    start_date: date,
+    return_mode: str,
+    needs_pe: bool,
+) -> tuple[bool, list[str], list[Row]]:
+    reasons: list[str] = []
+    if not csv_path.exists():
+        return False, ["本地数据文件不存在"], []
+
+    rows = load_rows(csv_path)
+    if not rows:
+        return False, ["本地数据文件为空"], []
+
+    if return_mode == "total_return" and any(row.total_return_index is None for row in rows):
+        reasons.append("缺少 total_return_index 列或数据")
+
+    if needs_pe and any(row.pe is None for row in rows):
+        reasons.append("所选策略需要 PE 数据，但本地数据不完整")
+
+    if not any(row.when >= start_date for row in rows):
+        reasons.append("没有覆盖回测起始日期之后的数据")
+
+    freshness_cutoff = previous_month_start(date.today())
+    latest = max(row.when for row in rows)
+    if latest < freshness_cutoff:
+        reasons.append(f"数据最新日期 {latest} 早于建议更新阈值 {freshness_cutoff}")
+
+    return len(reasons) == 0, reasons, rows
+
+
+def fetch_text(url: str) -> str:
+    request = Request(url, headers={"User-Agent": "Mozilla/5.0 StrategyBacktestSkill/1.0"})
+    with urlopen(request, timeout=30) as response:
+        return response.read().decode("utf-8", errors="ignore")
+
+
+def fetch_json(url: str) -> Any:
+    return json.loads(fetch_text(url))
+
+
+def fetch_yahoo_monthly_series(symbol: str, range_value: str = "25y", interval: str = "1mo") -> dict[date, dict[str, float | None]]:
+    query = urlencode(
+        {
+            "range": range_value,
+            "interval": interval,
+            "includeAdjustedClose": "true",
+            "events": "div,splits",
+        }
+    )
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?{query}"
+    payload = fetch_json(url)
+    result = payload["chart"]["result"][0]
+    timestamps = result.get("timestamp", [])
+    quote = result["indicators"]["quote"][0]
+    closes = quote.get("close", [])
+    adj = result["indicators"].get("adjclose", [{}])[0].get("adjclose", [])
+
+    series: dict[date, dict[str, float | None]] = {}
+    for idx, timestamp in enumerate(timestamps):
+        close = closes[idx] if idx < len(closes) else None
+        adjclose = adj[idx] if idx < len(adj) else None
+        if close is None:
+            continue
+        when = normalize_month(datetime.fromtimestamp(timestamp, tz=timezone.utc).date())
+        series[when] = {
+            "price_index": float(close),
+            "total_return_index": float(adjclose) if adjclose is not None else float(close),
+            "pe": None,
+        }
+    return series
+
+
+def fetch_multpl_monthly_pe(url: str) -> dict[date, float]:
+    text = fetch_text(url)
+    values: dict[date, float] = {}
+    for date_text, value_html in ROW_RE.findall(text):
+        when = normalize_month(datetime.strptime(date_text.strip(), "%b %d, %Y").date())
+        cleaned = html.unescape(TAG_RE.sub(" ", value_html)).replace("\xa0", " ")
+        matches = NUM_RE.findall(cleaned)
+        if not matches:
+            continue
+        values[when] = float(matches[-1].replace(",", ""))
+    return values
+
+
+def write_rows(csv_path: Path, rows: list[dict[str, Any]]) -> None:
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with csv_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["date", "price_index", "total_return_index", "pe"])
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def download_index_data(index_def: dict[str, Any], target_path: Path) -> list[str]:
+    download = index_def.get("download")
+    if not download:
+        raise ValueError(f"指数 '{index_def['name']}' 没有配置自动下载源。")
+
+    actions: list[str] = []
+    provider = download.get("provider")
+    if provider != "yahoo_chart":
+        raise ValueError(f"暂不支持下载提供方: {provider}")
+
+    symbol = download["symbol"]
+    range_value = download.get("range", "25y")
+    interval = download.get("interval", "1mo")
+    base_series = fetch_yahoo_monthly_series(symbol, range_value=range_value, interval=interval)
+    actions.append(f"已从 Yahoo Finance 下载 {index_def['name']} 代理数据，符号 {symbol}")
+
+    pe_provider = download.get("pe_provider")
+    if pe_provider and pe_provider.get("provider") == "multpl_pe":
+        pe_values = fetch_multpl_monthly_pe(pe_provider["url"])
+        for when, pe_value in pe_values.items():
+            if when in base_series:
+                base_series[when]["pe"] = pe_value
+        actions.append("已合并 Multpl 月度 PE 数据")
+
+    output_rows = []
+    for when in sorted(base_series):
+        values = base_series[when]
+        output_rows.append(
+            {
+                "date": when.isoformat(),
+                "price_index": f"{float(values['price_index']):.6f}",
+                "total_return_index": f"{float(values['total_return_index']):.6f}" if values["total_return_index"] is not None else "",
+                "pe": f"{float(values['pe']):.6f}" if values["pe"] is not None else "",
+            }
+        )
+    write_rows(target_path, output_rows)
+    actions.append(f"已写入本地数据文件 {target_path}")
+    return actions
+
+
+def find_index_definition(index_catalog: list[dict[str, Any]], index_name: str) -> dict[str, Any] | None:
+    if not index_name or index_name == "Custom Index":
+        return None
+    normalized = index_name.strip().lower()
+    for item in index_catalog:
+        names = [item["name"], *item.get("aliases", [])]
+        for name in names:
+            if normalized == name.strip().lower():
+                return item
+    for item in index_catalog:
+        names = [item["name"], *item.get("aliases", [])]
+        for name in names:
+            if normalized in name.strip().lower() or name.strip().lower() in normalized:
+                return item
+    return None
+
+
+def resolve_data_file(
+    args: argparse.Namespace,
+    index_catalog: list[dict[str, Any]],
+    strategies: list[dict[str, Any]],
+) -> tuple[Path, dict[str, Any] | None, list[str]]:
+    start_date = datetime.strptime(args.start_date, "%Y-%m-%d").date()
+    needs_pe = selected_strategies_need_pe(strategies)
+    actions: list[str] = []
+    index_def = find_index_definition(index_catalog, args.index_name)
+
+    if args.data_csv:
+        csv_path = Path(args.data_csv)
+    else:
+        if index_def is None:
+            raise ValueError("未指定 --data-csv，且无法根据 --index-name 匹配内置指数清单。")
+        csv_path = ROOT / index_def["default_local_csv"]
+        actions.append(f"已根据指数清单自动定位本地数据文件 {csv_path}")
+
+    okay, reasons, _ = assess_data_file(csv_path, start_date, args.return_mode, needs_pe)
+    if not okay:
+        actions.append("检测到本地数据缺失或不完整：" + "；".join(reasons))
+        if index_def is not None and index_def.get("download"):
+            actions.extend(download_index_data(index_def, csv_path))
+            okay, reasons, _ = assess_data_file(csv_path, start_date, args.return_mode, needs_pe)
+            if not okay:
+                raise ValueError("自动下载后数据仍不完整：" + "；".join(reasons))
+        else:
+            raise ValueError("本地数据不完整，且当前指数没有配置自动下载源：" + "；".join(reasons))
+    else:
+        actions.append("本地数据完整，直接用于回测")
+
+    return csv_path, index_def, actions
+
+
+def require_fields(strategies: list[dict[str, Any]], rows: list[Row], return_mode: str) -> None:
+    if return_mode == "total_return" and any(row.total_return_index is None for row in rows):
+        raise ValueError("return-mode=total_return requires total_return_index for every row.")
+
+    if selected_strategies_need_pe(strategies) and any(row.pe is None for row in rows):
         raise ValueError("Selected strategies require a 'pe' column with values for every row.")
 
 
@@ -341,6 +622,7 @@ def backtest_strategy(
     start_index: int,
     return_mode: str,
     top_periods: int,
+    market_profile: str,
 ) -> StrategyResult:
     shares = 0.0
     invested = 0.0
@@ -386,7 +668,7 @@ def backtest_strategy(
         else:
             current_streak = 0
             if current_period is not None:
-                current_period["context"] = major_market_context(current_period["start"], current_period["end"])
+                current_period["context"] = major_market_context(current_period["start"], current_period["end"], market_profile)
                 periods.append(current_period)
                 current_period = None
 
@@ -395,7 +677,7 @@ def backtest_strategy(
             monthly_returns.append(current_value / previous - 1.0)
 
     if current_period is not None:
-        current_period["context"] = major_market_context(current_period["start"], current_period["end"])
+        current_period["context"] = major_market_context(current_period["start"], current_period["end"], market_profile)
         periods.append(current_period)
 
     final_value = shares * choose_series_value(rows[-1], return_mode)
@@ -427,7 +709,7 @@ def backtest_strategy(
     )
 
 
-def market_state_summary(rows: list[Row], return_mode: str) -> dict[str, int]:
+def market_state_summary(rows: list[Row], start_index: int, return_mode: str) -> dict[str, int]:
     counts = {
         "<=5%": 0,
         "5%-10%": 0,
@@ -436,7 +718,7 @@ def market_state_summary(rows: list[Row], return_mode: str) -> dict[str, int]:
         "30%-40%": 0,
         ">40%": 0,
     }
-    for idx in range(len(rows)):
+    for idx in range(start_index, len(rows)):
         ctx = build_context(rows, idx, return_mode)
         dd = ctx["drawdown"]
         if dd > 0.40:
@@ -454,14 +736,27 @@ def market_state_summary(rows: list[Row], return_mode: str) -> dict[str, int]:
     return counts
 
 
-def list_table(catalog: list[dict[str, Any]]) -> str:
+def list_strategy_table(catalog: list[dict[str, Any]]) -> str:
     lines = [
         "| 策略编号 | 策略 | 规则描述 | 规则描述样例 |",
         "|---|---|---|---|",
     ]
     for item in catalog:
+        lines.append(f"| {item['id']} | {item['name']} | {item['rule_description']} | {item['rule_example']} |")
+    return "\n".join(lines)
+
+
+def list_index_table(catalog: list[dict[str, Any]]) -> str:
+    lines = [
+        "| 指数编号 | 指数名称 | 别名 | 市场画像 | 默认本地文件 | 自动下载 | 说明 |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for item in catalog:
+        aliases = " / ".join(item.get("aliases", []))
+        downloadable = "是" if item.get("download") else "否"
         lines.append(
-            f"| {item['id']} | {item['name']} | {item['rule_description']} | {item['rule_example']} |"
+            f"| {item['id']} | {item['name']} | {aliases} | {market_profile_label(item.get('market_profile', 'generic'))} | "
+            f"{item['default_local_csv']} | {downloadable} | {item.get('notes', '')} |"
         )
     return "\n".join(lines)
 
@@ -474,10 +769,10 @@ def comparison_table(results: list[StrategyResult]) -> str:
     ordered = sorted(
         results,
         key=lambda item: (
-            -item.total_invested,
             -item.total_return,
             -(item.annual_irr if item.annual_irr is not None else float("-inf")),
             item.max_drawdown,
+            item.total_invested,
         ),
     )
     for item in ordered:
@@ -510,29 +805,47 @@ def render_periods(periods: list[dict[str, Any]]) -> str:
 
 
 def render_report(
+    index_name: str,
+    market_profile: str,
+    data_path: Path,
+    data_actions: list[str],
     rows: list[Row],
+    start_index: int,
     return_mode: str,
     start_date: date,
     results: list[StrategyResult],
 ) -> str:
-    market_summary = market_state_summary(rows, return_mode)
+    market_summary = market_state_summary(rows, start_index, return_mode)
     lines = [
         "# Strategy Backtest Report",
         "",
+        f"- 回测指数: {index_name}",
+        f"- 市场画像: {market_profile_label(market_profile)}",
+        f"- 数据文件: {data_path}",
         f"- 回测起点: {start_date}",
         f"- 回测终点: {rows[-1].when}",
         f"- 回测模式: {'纯指数收益' if return_mode == 'price' else '全收益指数'}",
-        f"- 回测月份数: {len(rows)}",
+        f"- 回测月份数: {len(rows) - start_index}",
         "",
-        "## 策略对比",
+        "## 数据准备",
         "",
-        comparison_table(results),
-        "",
-        "## 市场状态分布",
-        "",
-        "| 回撤区间 | 月数 |",
-        "|---|---:|",
     ]
+    for action in data_actions:
+        lines.append(f"- {action}")
+
+    lines.extend(
+        [
+            "",
+            "## 策略对比",
+            "",
+            comparison_table(results),
+            "",
+            "## 市场状态分布",
+            "",
+            "| 回撤区间 | 月数 |",
+            "|---|---:|",
+        ]
+    )
     for label, value in market_summary.items():
         lines.append(f"| {label} | {value} |")
 
@@ -563,45 +876,109 @@ def render_report(
     return "\n".join(lines) + "\n"
 
 
+def write_default_report(report: str, explicit_output: str | None) -> list[Path]:
+    written_paths: list[Path] = []
+    DEFAULT_REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    DEFAULT_REPORT_PATH.write_text(report, encoding="utf-8")
+    written_paths.append(DEFAULT_REPORT_PATH)
+
+    if explicit_output:
+        explicit_path = Path(explicit_output)
+        explicit_path.parent.mkdir(parents=True, exist_ok=True)
+        explicit_path.write_text(report, encoding="utf-8")
+        if explicit_path.resolve() != DEFAULT_REPORT_PATH.resolve():
+            written_paths.append(explicit_path)
+    return written_paths
+
+
+def generate_default_chart(
+    data_csv: Path,
+    start_date: date,
+    index_name: str,
+    return_mode: str,
+    market_profile: str,
+) -> Path:
+    render_script = Path(__file__).resolve().parent / "render_summary_chart.py"
+    DEFAULT_CHART_PATH.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        sys.executable,
+        str(render_script),
+        "--data-csv",
+        str(data_csv),
+        "--start-date",
+        start_date.isoformat(),
+        "--index-name",
+        index_name,
+        "--return-mode",
+        return_mode,
+        "--market-profile",
+        market_profile,
+        "--output",
+        str(DEFAULT_CHART_PATH),
+    ]
+    subprocess.run(command, check=True)
+    return DEFAULT_CHART_PATH
+
+
 def main() -> None:
     args = parse_args()
-    catalog = load_catalog(Path(args.catalog), Path(args.custom_strategy_file) if args.custom_strategy_file else None)
+    strategy_catalog = load_catalog(Path(args.catalog), Path(args.custom_strategy_file) if args.custom_strategy_file else None)
+    index_catalog = load_json(Path(args.index_catalog))
 
     if args.list_strategies:
-        output = list_table(catalog)
+        output = list_strategy_table(strategy_catalog)
         if args.output:
             Path(args.output).write_text(output + "\n", encoding="utf-8")
         print(output)
         return
 
-    if not args.data_csv or not args.start_date:
-        raise SystemExit("--data-csv and --start-date are required unless --list-strategies is used.")
+    if args.list_indices:
+        output = list_index_table(index_catalog)
+        if args.output:
+            Path(args.output).write_text(output + "\n", encoding="utf-8")
+        print(output)
+        return
 
-    rows = load_rows(Path(args.data_csv))
-    start_date = datetime.strptime(args.start_date, "%Y-%m-%d").date()
-    filtered_rows = [row for row in rows if row.when >= start_date]
-    if not filtered_rows:
-        raise ValueError("No rows remain after applying the start date.")
-    start_index = next(index for index, row in enumerate(rows) if row.when >= start_date)
+    if not args.start_date:
+        raise SystemExit("--start-date is required unless --list-strategies or --list-indices is used.")
 
     selected_ids = None
     if args.strategy_ids:
         selected_ids = {item.strip() for item in args.strategy_ids.split(",") if item.strip()}
-    strategies = [item for item in catalog if selected_ids is None or item["id"] in selected_ids]
+    strategies = [item for item in strategy_catalog if selected_ids is None or item["id"] in selected_ids]
     if not strategies:
         raise ValueError("No strategies were selected.")
+
+    data_path, index_def, data_actions = resolve_data_file(args, index_catalog, strategies)
+    rows = load_rows(data_path)
+    start_date = datetime.strptime(args.start_date, "%Y-%m-%d").date()
+    start_index = next((index for index, row in enumerate(rows) if row.when >= start_date), -1)
+    if start_index == -1:
+        raise ValueError("No rows remain after applying the start date.")
+
+    if index_def and args.index_name == "Custom Index":
+        args.index_name = index_def["name"]
+
+    if index_def and args.market_profile == "auto":
+        market_profile = index_def.get("market_profile", infer_market_profile(args.index_name, args.market_profile))
+    else:
+        market_profile = infer_market_profile(args.index_name, args.market_profile)
 
     require_fields(strategies, rows, args.return_mode)
 
     results = []
     for strategy in strategies:
-        result = backtest_strategy(strategy, rows, start_index, args.return_mode, args.top_periods)
+        result = backtest_strategy(strategy, rows, start_index, args.return_mode, args.top_periods, market_profile)
         results.append(result)
 
-    report = render_report(filtered_rows, args.return_mode, start_date, results)
-    if args.output:
-        Path(args.output).write_text(report, encoding="utf-8")
+    report = render_report(args.index_name, market_profile, data_path, data_actions, rows, start_index, args.return_mode, start_date, results)
+    written_reports = write_default_report(report, args.output)
+    chart_path = generate_default_chart(data_path, start_date, args.index_name, args.return_mode, market_profile)
     print(report)
+    print("已写入报告文件:")
+    for path in written_reports:
+        print(f"- {path}")
+    print(f"已写入图表文件:\n- {chart_path}")
 
 
 if __name__ == "__main__":
