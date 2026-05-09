@@ -1,0 +1,39 @@
+[
+  {
+    "id": "C001",
+    "name": "Custom drawdown total",
+    "rule_description": "Example custom strategy using drawdown thresholds.",
+    "rule_example": "Drawdown >10% invest 2000; >20% invest 4000; >30% invest 7000.",
+    "kind": "drawdown_total",
+    "base_amount": 1000,
+    "bands": [
+      { "threshold": 0.1, "total_amount": 2000 },
+      { "threshold": 0.2, "total_amount": 4000 },
+      { "threshold": 0.3, "total_amount": 7000 }
+    ]
+  },
+  {
+    "id": "C002",
+    "name": "Custom PE plus drawdown",
+    "rule_description": "Example composite strategy.",
+    "rule_example": "PE >90% invest 500, 30%-90% invest 1000, <30% invest 1500; add 1000 when drawdown >10%.",
+    "kind": "composite_sum",
+    "components": [
+      {
+        "kind": "pe_percentile",
+        "high_threshold": 90.0,
+        "low_threshold": 30.0,
+        "high_amount": 500,
+        "mid_amount": 1000,
+        "low_amount": 1500
+      },
+      {
+        "kind": "drawdown_total",
+        "base_amount": 0,
+        "bands": [
+          { "threshold": 0.1, "total_amount": 1000 }
+        ]
+      }
+    ]
+  }
+]
